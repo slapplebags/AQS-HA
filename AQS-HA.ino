@@ -1,8 +1,12 @@
 /*
-  ESP32 + (SEN66 OR BMV080) + MQTT + Home Assistant Discovery
+  ESP32 + (SEN66 OR BMV080 OR PMS-UART) + MQTT + Home Assistant Discovery
   with WiFiManager captive-portal config
 
-  Portal lets you enter Wi-Fi + MQTT + HA prefix + friendly name + sensor type (sen66|bmv080).
+  Portal lets you enter Wi-Fi + MQTT + HA prefix + friendly name + sensor type (sen66|bmv080|pms).
+
+  FIX (Jan 2026):
+  - chipId() now uses FULL 48-bit MAC (12 hex chars) instead of low 24 bits.
+    This prevents two boards from colliding in Home Assistant discovery unique_id/topics.
 */
 
 #include <Arduino.h>
@@ -38,6 +42,12 @@ const uint32_t BMV_SERVICE_MS = 50;
 // BMV080 default I2C addr on SparkFun breakout
 #define BMV080_ADDR 0x57
 
+// PMS-style UART sensor (Plantower-compatible frames 0x42 0x4D 0x00 0x1C ...)
+static constexpr uint32_t PMS_BAUD = 9600;
+// Your working pins:
+static constexpr int PMS_TX_PIN = D3; // XIAO TX -> sensor RX
+static constexpr int PMS_RX_PIN = D4; // XIAO RX <- sensor TX
+
 // ---------------- Globals ----------------
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
@@ -49,6 +59,9 @@ SensirionI2cSen66 sen66;
 // BMV080 instance
 SparkFunBMV080 bmv080;
 
+// PMS UART instance
+HardwareSerial pmsSerial(1);
+
 static char errorMessage[64];
 static int16_t error;
 
@@ -59,7 +72,7 @@ String base_topic;
 String avail_topic;
 
 // ---------------- Config ----------------
-enum SensorType : uint8_t { SENSOR_SEN66 = 0, SENSOR_BMV080 = 1 };
+enum SensorType : uint8_t { SENSOR_SEN66 = 0, SENSOR_BMV080 = 1, SENSOR_PMS = 2 };
 
 struct AppConfig {
   char mqtt_host[64]      = "10.18.14.36";
@@ -67,8 +80,8 @@ struct AppConfig {
   char mqtt_user[64]      = "front_door";
   char mqtt_pass[64]      = "!90c6965dD";
   char ha_prefix[32]      = "homeassistant";
-  char friendly_name[32]  = "Air Sensor";
-  char sensor_type[16]    = "sen66"; // "sen66" or "bmv080"
+  char friendly_name[32]  = "Air Sensor PMS5003";
+  char sensor_type[16]    = "pms"; // "sen66" or "bmv080" or "pms"
 } cfg;
 
 SensorType activeSensor = SENSOR_SEN66;
@@ -82,6 +95,10 @@ unsigned long last_bmv_service_ms = 0;
 // BMV080 cached values (updated frequently)
 float bmv_pm1 = NAN, bmv_pm25 = NAN, bmv_pm10 = NAN;
 bool  bmv_obstructed = false;
+
+// PMS cached values (read on publish cadence)
+uint16_t pms_pm1 = 0, pms_pm25 = 0, pms_pm10 = 0;
+bool pms_has_reading = false;
 
 // ---------------- Forward declarations ----------------
 void loadConfig();
@@ -105,12 +122,17 @@ void publishSen66State(float pm1, float pm25, float pm4, float pm10,
                        float rh, float tempC, float vocIndex, float noxIndex, uint16_t co2);
 
 void publishBmv080State(float pm1, float pm25, float pm10, bool obstructed);
+void publishPmsState(uint16_t pm1, uint16_t pm25, uint16_t pm10);
 
 String chipId();
 void safeTopicify(String &s);
 
 bool initSen66();
 bool initBmv080();
+bool initPms();
+
+// PMS frame reader
+bool pmsReadAtm(uint16_t &pm1, uint16_t &pm25, uint16_t &pm10);
 
 // ---------------- WiFiManager save callback ----------------
 void saveConfigCallback() { shouldSaveConfig = true; }
@@ -128,15 +150,14 @@ void setup() {
   loadConfig();
 
   // Decide active sensor from cfg
-  if (String(cfg.sensor_type).equalsIgnoreCase("bmv080")) {
-    activeSensor = SENSOR_BMV080;
-  } else {
-    activeSensor = SENSOR_SEN66;
-  }
+  String st0 = String(cfg.sensor_type);
+  st0.trim(); st0.toLowerCase();
+  if (st0 == "bmv080")      activeSensor = SENSOR_BMV080;
+  else if (st0 == "pms")    activeSensor = SENSOR_PMS;
+  else                      activeSensor = SENSOR_SEN66;
 
   // Create a device_id that is stable and unique per board.
-  // (If you want SEN66 serial-based IDs only, keep that inside initSen66().)
-  device_id = chipId();
+  device_id = chipId(); // (will be overridden in initSen66/initBmv080/initPms)
 
   // WiFiManager
   bool forcePortal = (digitalRead(CONFIG_TRIGGER_PIN) == LOW);
@@ -155,7 +176,7 @@ void setup() {
   WiFiManagerParameter p_mqtt_pass("mqtt_pass", "MQTT Password", cfg.mqtt_pass, sizeof(cfg.mqtt_pass));
   WiFiManagerParameter p_ha_prefix("ha_prefix", "HA Discovery Prefix", cfg.ha_prefix, sizeof(cfg.ha_prefix));
   WiFiManagerParameter p_friendly("friendly_name", "Device Friendly Name", cfg.friendly_name, sizeof(cfg.friendly_name));
-  WiFiManagerParameter p_sensor_type("sensor_type", "Sensor Type (sen66|bmv080)", cfg.sensor_type, sizeof(cfg.sensor_type));
+  WiFiManagerParameter p_sensor_type("sensor_type", "Sensor Type (sen66|bmv080|pms)", cfg.sensor_type, sizeof(cfg.sensor_type));
 
   wm.addParameter(&p_mqtt_host);
   wm.addParameter(&p_mqtt_port);
@@ -193,7 +214,7 @@ void setup() {
   String st = String(cfg.sensor_type);
   st.trim();
   st.toLowerCase();
-  if (st != "bmv080") st = "sen66";
+  if (st != "bmv080" && st != "pms") st = "sen66";
   strncpy(cfg.sensor_type, st.c_str(), sizeof(cfg.sensor_type));
 
   if (strlen(cfg.ha_prefix) == 0) {
@@ -206,14 +227,18 @@ void setup() {
   }
 
   // Determine active sensor now that config is final
-  activeSensor = (String(cfg.sensor_type) == "bmv080") ? SENSOR_BMV080 : SENSOR_SEN66;
+  activeSensor = (String(cfg.sensor_type) == "bmv080") ? SENSOR_BMV080 :
+                 (String(cfg.sensor_type) == "pms")   ? SENSOR_PMS   :
+                                                        SENSOR_SEN66;
 
   // Init sensor and compute device_id (SEN66 prefers serial-based id)
   bool sensor_ok = false;
   if (activeSensor == SENSOR_SEN66) {
     sensor_ok = initSen66();
-  } else {
+  } else if (activeSensor == SENSOR_BMV080) {
     sensor_ok = initBmv080();
+  } else {
+    sensor_ok = initPms();
   }
 
   if (!sensor_ok) {
@@ -222,11 +247,16 @@ void setup() {
     ESP.restart();
   }
 
+  // Make sure device_id is safe for topics
   safeTopicify(device_id);
+
   mqtt_client_id = "esp32_" + device_id;
 
   // Topics depend on sensor type
-  String prefix = (activeSensor == SENSOR_SEN66) ? "sen66/" : "bmv080/";
+  String prefix =
+    (activeSensor == SENSOR_SEN66)  ? "sen66/"  :
+    (activeSensor == SENSOR_BMV080) ? "bmv080/" :
+                                      "pms/";
   base_topic  = prefix + device_id;
   avail_topic = base_topic + "/status";
 
@@ -279,13 +309,23 @@ void loop() {
                       pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
         publishSen66State(pm1, pm25, pm4, pm10, rh, tempC, voc, nox, co2);
       }
-    } else {
+    } else if (activeSensor == SENSOR_BMV080) {
       if (!isnan(bmv_pm1) && !isnan(bmv_pm25) && !isnan(bmv_pm10)) {
         Serial.printf("BMV080 PM1=%.2f PM2.5=%.2f PM10=%.2f Obstructed=%s\n",
                       bmv_pm1, bmv_pm25, bmv_pm10, bmv_obstructed ? "true" : "false");
         publishBmv080State(bmv_pm1, bmv_pm25, bmv_pm10, bmv_obstructed);
       } else {
         Serial.println("BMV080: no readings yet (still warming/servicing).");
+      }
+    } else {
+      uint16_t pm1=0, pm25=0, pm10=0;
+      if (pmsReadAtm(pm1, pm25, pm10)) {
+        pms_pm1 = pm1; pms_pm25 = pm25; pms_pm10 = pm10;
+        pms_has_reading = true;
+        Serial.printf("PMS (ATM) PM1=%u PM2.5=%u PM10=%u\n", pm1, pm25, pm10);
+        publishPmsState(pm1, pm25, pm10);
+      } else {
+        Serial.println("PMS: no valid frame yet (check wiring/baud).");
       }
     }
   }
@@ -324,7 +364,6 @@ bool initSen66() {
 }
 
 bool initBmv080() {
-  // BMV080 uses SparkFun library init sequence
   if (!bmv080.begin(BMV080_ADDR, Wire)) {
     Serial.println("BMV080 not detected at 0x57. Check wiring/jumper.");
     return false;
@@ -338,9 +377,73 @@ bool initBmv080() {
     return false;
   }
 
-  // device_id for BMV080: stable per board
   device_id = "bmv080_" + chipId();
   return true;
+}
+
+bool initPms() {
+  // Start UART and give sensor time to boot/stream
+  pmsSerial.begin(PMS_BAUD, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
+  delay(1200);
+
+  device_id = "pms_" + chipId();
+  return true;
+}
+
+// --------------- PMS frame reader (ATM only) ---------------
+static inline uint16_t u16be(const uint8_t* p) {
+  return (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+}
+
+static bool pmsReadExact(uint8_t* out, size_t n, uint32_t timeout_ms) {
+  uint32_t start = millis();
+  size_t got = 0;
+  while (got < n && (millis() - start) < timeout_ms) {
+    while (pmsSerial.available() && got < n) {
+      out[got++] = (uint8_t)pmsSerial.read();
+    }
+    delay(1);
+  }
+  return got == n;
+}
+
+bool pmsReadAtm(uint16_t &pm1, uint16_t &pm25, uint16_t &pm10) {
+  static constexpr size_t FRAME_LEN = 32;
+  uint8_t f[FRAME_LEN];
+
+  while (pmsSerial.available()) {
+    int b = pmsSerial.read();
+    if (b < 0) break;
+    if ((uint8_t)b != 0x42) continue;
+
+    uint32_t t0 = millis();
+    while (!pmsSerial.available() && (millis() - t0) < 50) delay(1);
+    if (!pmsSerial.available()) return false;
+
+    uint8_t b2 = (uint8_t)pmsSerial.read();
+    if (b2 != 0x4D) continue;
+
+    f[0] = 0x42;
+    f[1] = 0x4D;
+
+    if (!pmsReadExact(f + 2, FRAME_LEN - 2, 200)) return false;
+
+    // length must be 0x001C
+    if (u16be(f + 2) != 0x001C) continue;
+
+    // checksum: sum bytes 0..29 equals uint16 at 30..31
+    uint32_t sum = 0;
+    for (int i = 0; i < 30; i++) sum += f[i];
+    if ((uint16_t)sum != u16be(f + 30)) continue;
+
+    // ATM values at offsets 10/12/14
+    pm1  = u16be(f + 10);
+    pm25 = u16be(f + 12);
+    pm10 = u16be(f + 14);
+    return true;
+  }
+
+  return false;
 }
 
 // --------------- Config (NVS) ---------------
@@ -432,7 +535,9 @@ void publishDiscovery() {
   }
 
   Serial.printf("Publishing HA discovery prefix='%s' device_id='%s' sensor='%s'\n",
-                cfg.ha_prefix, device_id.c_str(), (activeSensor == SENSOR_SEN66) ? "sen66" : "bmv080");
+                cfg.ha_prefix, device_id.c_str(),
+                (activeSensor == SENSOR_SEN66) ? "sen66" :
+                (activeSensor == SENSOR_BMV080) ? "bmv080" : "pms");
 
   if (activeSensor == SENSOR_SEN66) {
     publishConfigSensor("pm1",        "PM1.0",       "µg/m³", "pm1",            "measurement", "mdi:blur",            "pm1");
@@ -444,16 +549,20 @@ void publishDiscovery() {
     publishConfigSensor("voc_index",  "VOC Index",   "",      "",               "measurement", "mdi:chemical-weapon", "voc_index");
     publishConfigSensor("nox_index",  "NOx Index",   "",      "",               "measurement", "mdi:chemical-weapon", "nox_index");
     publishConfigSensor("co2eq",      "CO2 (eq)",    "ppm",   "carbon_dioxide", "measurement", "",                    "co2eq");
-  } else {
+  } else if (activeSensor == SENSOR_BMV080) {
     publishConfigSensor("pm1",   "PM1.0",  "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
     publishConfigSensor("pm25",  "PM2.5",  "µg/m³", "pm25", "measurement", "",         "pm25");
     publishConfigSensor("pm10",  "PM10",   "µg/m³", "pm10", "measurement", "",         "pm10");
 
-    // Binary sensor for obstruction
     publishConfigBinarySensor("obstructed", "Optics Obstructed",
                               "problem", "mdi:alert-circle",
                               "obstructed",
                               "ON", "OFF");
+  } else {
+    // PMS: ATM-only PMs
+    publishConfigSensor("pm1",   "PM1.0", "µg/m³", "pm1",  "measurement", "mdi:blur", "pm1");
+    publishConfigSensor("pm25",  "PM2.5", "µg/m³", "pm25", "measurement", "",         "pm25");
+    publishConfigSensor("pm10",  "PM10",  "µg/m³", "pm10", "measurement", "",         "pm10");
   }
 
   discovery_published = true;
@@ -484,8 +593,15 @@ void publishConfigSensor(
 
   payload += "\"device\":{";
   payload +=   "\"identifiers\":[\"" + device_id + "\"],";
-  payload +=   "\"manufacturer\":\"" + String((activeSensor == SENSOR_SEN66) ? "Sensirion" : "Bosch") + "\",";
-  payload +=   "\"model\":\"" + String((activeSensor == SENSOR_SEN66) ? "SEN66" : "BMV080") + "\",";
+
+  if (activeSensor == SENSOR_SEN66) {
+    payload += "\"manufacturer\":\"Sensirion\",\"model\":\"SEN66\",";
+  } else if (activeSensor == SENSOR_BMV080) {
+    payload += "\"manufacturer\":\"Bosch\",\"model\":\"BMV080\",";
+  } else {
+    payload += "\"manufacturer\":\"PMS-compatible\",\"model\":\"PMS UART\",";
+  }
+
   payload +=   "\"name\":\"" + String(cfg.friendly_name) + "\"";
   payload += "}";
   payload += "}";
@@ -552,17 +668,24 @@ void publishBmv080State(float pm1, float pm25, float pm10, bool obstructed) {
   publishOne("pm1",  String(pm1, 2));
   publishOne("pm25", String(pm25, 2));
   publishOne("pm10", String(pm10, 2));
-
-  // For binary_sensor payloads
   publishOne("obstructed", obstructed ? "ON" : "OFF");
+}
+
+void publishPmsState(uint16_t pm1, uint16_t pm25, uint16_t pm10) {
+  if (!discovery_published && mqtt.connected()) publishDiscovery();
+
+  publishOne("pm1",  String(pm1));
+  publishOne("pm25", String(pm25));
+  publishOne("pm10", String(pm10));
 }
 
 // --------------- Utilities ---------------
 String chipId() {
-  uint64_t mac = ESP.getEfuseMac();
-  uint32_t low = (uint32_t)(mac & 0xFFFFFF);
-  char buf[9];
-  snprintf(buf, sizeof(buf), "%06X", low);
+  // FULL 48-bit MAC -> 12 hex chars. Prevents collisions between boards.
+  uint64_t mac = ESP.getEfuseMac(); // MAC is in low 48 bits
+  char buf[13]; // 12 + NUL
+  snprintf(buf, sizeof(buf), "%012llX",
+           (unsigned long long)(mac & 0xFFFFFFFFFFFFULL));
   return String(buf);
 }
 
